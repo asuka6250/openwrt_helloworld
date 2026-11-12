@@ -1,0 +1,91 @@
+name: Universal Upstream Force Sync (No Extra Branch)
+
+on:
+  schedule:
+    - cron: '0 16 * * 1,4'
+  workflow_dispatch:
+
+jobs:
+  sync-all-branches:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 允许推送代码
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Backup Action Script
+        run: |
+          # 第一步：把当前运行的脚本备份到 /tmp 目录（Git 覆盖不到这里）
+          cp .github/workflows/auto-sync.yml /tmp/auto-sync-backup.yml
+          echo "✅ 脚本已备份到安全区域"
+
+      - name: Auto-Detect, Sync and Inject
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 获取当前 Action 所在的分支名 (例如 main)
+          CURRENT_BRANCH=${GITHUB_REF#refs/heads/}
+          echo "当前运行分支: $CURRENT_BRANCH"
+
+          echo "=== 1. 自动识别上游仓库 ==="
+          PARENT_REPO=$(gh api repos/${{ github.repository }} --jq '.parent.full_name')
+          
+          if [ -z "$PARENT_REPO" ] || [ "$PARENT_REPO" == "null" ]; then
+            echo "错误: 找不到上游仓库！请确认当前项目是一个 Fork 项目。"
+            exit 1
+          fi
+          echo "成功识别到上游仓库: $PARENT_REPO"
+
+          echo "=== 2. 配置 Git 与 Remote ==="
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git remote add upstream https://github.com/$PARENT_REPO.git
+          git fetch upstream
+
+          echo "=== 3. 同步分支并注入脚本 ==="
+          # 获取当前 Fork 仓库的所有分支
+          for branch in $(git ls-remote --heads origin | awk -F'refs/heads/' '{print $2}'); do
+            
+            # 检查上游仓库是否存在同名分支
+            if git ls-remote --heads upstream $branch | grep -q $branch; then
+              
+              if [ "$branch" == "$CURRENT_BRANCH" ]; then
+                # 【核心逻辑】：如果是当前运行脚本所在的分支
+                echo "🔄 正在重置并注入脚本到当前分支: $branch ..."
+                git checkout $branch
+                
+                # 强制重置为上游状态（此时工作区的旧 action 文件会被抹除）
+                git reset --hard upstream/$branch
+                
+                # 从 /tmp 恢复脚本文件
+                mkdir -p .github/workflows
+                cp /tmp/auto-sync-backup.yml .github/workflows/auto-sync.yml
+                
+                # 将恢复的脚本单独提交
+                git add .github/workflows/auto-sync.yml
+                if ! git diff --cached --quiet; then
+                  git commit -m "chore: inject auto-sync action"
+                fi
+                
+                # 强制推送到自己的仓库
+                git push origin $branch --force
+                echo "✅ 分支 $branch 同步并注入完成。"
+              
+              else
+                # 对于其他非当前分支，无需检出代码，直接通过远端引用强制覆盖，速度更快
+                echo "🔄 正在强制同步其他分支: $branch ..."
+                git push origin refs/remotes/upstream/$branch:refs/heads/$branch --force
+                echo "✅ 分支 $branch 同步完成。"
+              fi
+
+            else
+              echo "⚠️ 上游不存在分支 $branch，跳过同步。"
+            fi
+            
+          done
+          echo "🎉 所有分支处理完毕！"
